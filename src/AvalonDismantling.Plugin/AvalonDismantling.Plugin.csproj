@@ -1,0 +1,11 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <ItemGroup><ProjectReference Include="../AvalonDismantling.Core/AvalonDismantling.Core.csproj" /></ItemGroup>
+  <ItemGroup>
+    <GameLibrary Include="$(GameRoot)/Fall of Avalon_Data/Managed/*.dll" Exclude="$(GameRoot)/Fall of Avalon_Data/Managed/System*.dll;$(GameRoot)/Fall of Avalon_Data/Managed/mscorlib.dll;$(GameRoot)/Fall of Avalon_Data/Managed/netstandard.dll;$(GameRoot)/Fall of Avalon_Data/Managed/Mono*.dll" />
+    <GameLibrary Include="$(GameRoot)/BepInEx/core/BepInEx.dll;$(GameRoot)/BepInEx/core/0Harmony.dll" />
+    <Reference Include="@(GameLibrary)"><HintPath>%(Identity)</HintPath><Private>false</Private></Reference>
+  </ItemGroup>
+  <Target Name="RequireGameRoot" BeforeTargets="ResolveReferences">
+    <Error Condition="!Exists('$(GameRoot)/Fall of Avalon_Data/Managed/TG.Main.dll')" Text="Set GameRoot to the supported local Mono game installation." />
+  </Target>
+</Project>

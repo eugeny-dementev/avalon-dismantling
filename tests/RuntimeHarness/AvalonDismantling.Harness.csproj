@@ -1,0 +1,12 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <AssemblyName>AvalonDismantling.Harness</AssemblyName>
+    <IsPackable>false</IsPackable>
+  </PropertyGroup>
+  <ItemGroup>
+    <ProjectReference Include="../../src/AvalonDismantling.Plugin/AvalonDismantling.Plugin.csproj" />
+    <GameLibrary Include="$(GameRoot)/Fall of Avalon_Data/Managed/*.dll" Exclude="$(GameRoot)/Fall of Avalon_Data/Managed/System*.dll;$(GameRoot)/Fall of Avalon_Data/Managed/mscorlib.dll;$(GameRoot)/Fall of Avalon_Data/Managed/netstandard.dll;$(GameRoot)/Fall of Avalon_Data/Managed/Mono*.dll" />
+    <GameLibrary Include="$(GameRoot)/BepInEx/core/BepInEx.dll;$(GameRoot)/BepInEx/core/0Harmony.dll" />
+    <Reference Include="@(GameLibrary)"><HintPath>%(Identity)</HintPath><Private>false</Private></Reference>
+  </ItemGroup>
+</Project>
