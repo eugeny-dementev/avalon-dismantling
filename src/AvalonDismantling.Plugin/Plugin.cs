@@ -11,7 +11,7 @@ using UnityEngine.UI;
 
 namespace AvalonDismantling.Plugin;
 
-[BepInPlugin("com.eugenydementev.avalondismantling", "Avalon Dismantling", "1.0.0")]
+[BepInPlugin("com.eugenydementev.avalondismantling", "Avalon Dismantling", "1.0.1")]
 public sealed class Plugin : BaseUnityPlugin
 {
     internal static ManualLogSource Log { get; private set; } = null!;
@@ -31,7 +31,7 @@ public sealed class Plugin : BaseUnityPlugin
             _harmony = new Harmony("com.eugenydementev.avalondismantling");
             _harmony.Patch(initialize, postfix: new HarmonyMethod(typeof(Plugin), nameof(AddBenchButton)));
             _available = true;
-            Log.LogInfo("Avalon Dismantling 1.0.0 loaded. Bench integration is ready.");
+            Log.LogInfo("Avalon Dismantling 1.0.1 loaded. Bench integration is ready.");
         }
         catch (Exception error)
         {

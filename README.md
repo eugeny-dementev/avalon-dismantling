@@ -2,7 +2,7 @@
 
 Recover crafting materials from equipment at crafting benches in **Tainted Grail: The Fall of Avalon**.
 
-Version 1.0.0 targets the **1.30.012 Mono build** with **BepInEx 5.4.23.6 x64**. IL2CPP builds are unsupported.
+Version 1.0.1 targets the **1.30.012 Mono build** with **BepInEx 5.4.23.6 x64**. IL2CPP builds are unsupported.
 
 Downloads: [GitHub releases](https://github.com/eugeny-dementev/avalon-dismantling/releases) · [Nexus Mods](https://www.nexusmods.com/taintedgrailthefallofavalon/mods/395)
 

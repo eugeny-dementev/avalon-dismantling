@@ -4,6 +4,27 @@ Target: Tainted Grail: The Fall of Avalon 1.30.012 Mono, BepInEx 5.4.23.6, Unity
 
 ## Completed
 
+### 1.0.1 performance regression check
+
+Tested against a copy of the latest bench save, Slot 72, with the installed mod collection.
+Three synthetic sword confirmations used the carried inventory and native Dismantle UI.
+Timings exclude the unchanged 0.65-second confirmation hold.
+
+| Measurement | Before | 1.0.1 |
+| --- | --- | --- |
+| Repeated confirmation processing | 4343–4709 ms | 212–273 ms |
+| Inventory refresh | 4212–4308 ms | 12–27 ms |
+
+The full native list rebuild caused the pause. Soft refresh preserves unchanged rows and removes consumed rows.
+The benchmark checks both row identity preservation and removal of the consumed item.
+New equipment still triggers a full rebuild so recovered equipment can appear in the list.
+Confirmation revalidates the selected live recipe without scanning every loaded recipe again.
+
+All 121 calculation checks, 22 native inventory cases, and five UI checks passed for 1.0.1.
+The added inventory case changes a raw recipe quantity and verifies rejection without inventory changes.
+Normal crafting opens after Dismantle closes. Production saves are excluded from the test profile.
+Save/reload and physical controller input were not repeated for this performance update.
+
 - Calculation tests: 121 assertions passed.
 - Plugin compilation: zero warnings and zero errors.
 - Static inspection confirmed the retained layout and native bench entry point.

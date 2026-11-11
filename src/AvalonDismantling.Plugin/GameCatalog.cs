@@ -43,12 +43,14 @@ internal sealed class GameCatalog
     private static readonly FieldInfo RawCount = RequireField(typeof(Ingredient), "count", typeof(int));
     private static readonly FieldInfo RawIngredients = RequireField(typeof(BaseRecipe), "ingredients", typeof(Ingredient[]));
     private readonly List<Recipe> _recipes = new List<Recipe>();
+    private readonly Dictionary<string, BaseRecipe> _definitions = new Dictionary<string, BaseRecipe>(StringComparer.Ordinal);
     private readonly Dictionary<string, ItemTemplate> _materials = new Dictionary<string, ItemTemplate>(StringComparer.Ordinal);
     private readonly Dictionary<string, ItemTemplate> _outcomes = new Dictionary<string, ItemTemplate>(StringComparer.Ordinal);
     private readonly Dictionary<string, Recipe?> _matches = new Dictionary<string, Recipe?>(StringComparer.Ordinal);
 
     public GameCatalog()
     {
+        var timer = System.Diagnostics.Stopwatch.StartNew();
         TemplatesProvider provider = World.Services.Get<TemplatesProvider>();
         if (!provider.AllLoaded) throw new InvalidOperationException("Item templates are still loading. Reopen the bench shortly.");
         var seen = new HashSet<string>(StringComparer.Ordinal);
@@ -68,6 +70,7 @@ internal sealed class GameCatalog
                 var counts = ingredients.Select(i => new KeyValuePair<string, int>(i.Template.GUID, (int)RawCount.GetValue(i))).ToArray();
                 var entry = new Recipe(recipe.GUID, Profile(outcome), recipe.Quantity, counts);
                 _recipes.Add(entry);
+                _definitions.Add(entry.Id, recipe);
                 _outcomes[outcome.GUID] = outcome;
                 foreach (Ingredient ingredient in ingredients) _materials[ingredient.Template.GUID] = ingredient.Template;
             }
@@ -77,10 +80,25 @@ internal sealed class GameCatalog
             }
         }
         if (_recipes.Count == 0) throw new InvalidOperationException("No eligible handcrafting recipes were loaded.");
-        Plugin.Log.LogInfo($"Dismantling catalog: {_recipes.Count} eligible recipes, {_outcomes.Count} exact output templates.");
+        Plugin.Log.LogInfo($"Dismantling catalog: {_recipes.Count} eligible recipes, {_outcomes.Count} exact output templates; {timer.Elapsed.TotalMilliseconds:F1} ms.");
     }
 
     public ItemTemplate Material(string guid) => _materials[guid];
+
+    internal void Revalidate(Recipe expected)
+    {
+        // Recipes are indexed once per menu; only the selected definition needs a live check.
+        if (!_definitions.TryGetValue(expected.Id, out BaseRecipe recipe) || recipe.IsHidden ||
+            !string.IsNullOrEmpty(recipe.StoryOnCreation.GUID) || recipe.Quantity != expected.Quantity ||
+            recipe.Outcome == null || recipe.Outcome.GUID != expected.Outcome.Id || !AllowedTemplate(recipe.Outcome))
+            throw new InvalidOperationException("The recipe changed. Reopen the dismantling menu.");
+        Ingredient[] ingredients = ((Ingredient[])RawIngredients.GetValue(recipe))?
+            .Where(i => i == null || !IsGoldFee(i.Template)).ToArray()!;
+        if (ingredients == null || ingredients.Any(i => i == null || !AllowedMaterial(i.Template)) ||
+            !Recovery.Merge(ingredients.Select(i => new KeyValuePair<string, int>(i.Template.GUID, (int)RawCount.GetValue(i))))
+                .SequenceEqual(expected.Ingredients))
+            throw new InvalidOperationException("The recipe ingredients changed. Reopen the dismantling menu.");
+    }
 
     public static bool IsSupported(ItemTemplate template) => template != null && !template.IsAbstract &&
         !template.IsMagic && !template.IsSoulCube && !template.IsSpectralWeapon && !template.IsDefaultFists &&

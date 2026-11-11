@@ -58,6 +58,7 @@ Wait for `last-command.json` to report completion before sending another command
 | `open-bench` | Open the native bench menu with a loaded handcrafting station configuration. |
 | `close-bench` | Close the dismantling and bench test models. |
 | `run-tests` | Run native inventory tests and write `native-tests.json`. |
+| `benchmark` | Time three synthetic sword confirmations with the copied inventory; verify retained and removed native rows. |
 | `run-ui-tests` | Check selection, cancellation, reopening, and native confirmation callbacks; write `ui-tests.json`. |
 | `test-vanilla-crafting` | Close a test Dismantle menu, open native Craft, and select a learned recipe without crafting. |
 | `preview-item` | Open Dismantle through its native bench button and preview an existing eligible item for screenshots. |

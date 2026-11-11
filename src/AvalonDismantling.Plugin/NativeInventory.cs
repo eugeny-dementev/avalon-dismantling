@@ -37,8 +37,7 @@ internal static class NativeInventory
 
     private static IReadOnlyDictionary<string, int> ExecuteLocked(GameCatalog catalog, Quote preview)
     {
-        // Re-read live recipe definitions and DLC availability at the confirmation boundary.
-        catalog = new GameCatalog();
+        catalog.Revalidate(preview.Plan.Recipe);
         Quote current = catalog.Quote(preview.Source, preview.Plan.Batches);
         if (current.SourceQuantity != preview.SourceQuantity || current.DisplayLevel != preview.DisplayLevel ||
             current.Plan.Recipe.Id != preview.Plan.Recipe.Id || !current.Plan.PerBatch.SequenceEqual(preview.Plan.PerBatch))

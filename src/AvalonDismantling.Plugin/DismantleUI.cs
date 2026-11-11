@@ -130,7 +130,9 @@ internal sealed class DismantleUI : Model, IUIStateSource, IItemChooseParent, IP
         _confirm.SetActive(false);
         try
         {
+            var timer = System.Diagnostics.Stopwatch.StartNew();
             IReadOnlyDictionary<string, int> recovered = NativeInventory.Execute(_catalog, quote);
+            double transactionMs = timer.Elapsed.TotalMilliseconds;
             string result = "Recovered: " + string.Join(", ", recovered.Select(entry => $"{entry.Value} {_catalog.Material(entry.Key).ItemName}"));
             _lastResult = result;
             _quote = null;
@@ -140,7 +142,10 @@ internal sealed class DismantleUI : Model, IUIStateSource, IItemChooseParent, IP
             _tooltip.SetDescriptor(null);
             _view.SetDetails("Dismantling complete", "Select another item to continue.");
             _view.SetStatus(result);
+            double presentationMs = timer.Elapsed.TotalMilliseconds - transactionMs;
+            timer.Restart();
             _list.Refresh();
+            Plugin.Log.LogInfo($"Dismantling timings: transaction={transactionMs:F1} ms; result={presentationMs:F1} ms; refresh={timer.Elapsed.TotalMilliseconds:F1} ms.");
         }
         catch (Exception error)
         {
@@ -170,6 +175,7 @@ internal sealed class DismantleUI : Model, IUIStateSource, IItemChooseParent, IP
 
 internal sealed class DismantleItemList : ItemChooseUI<DismantleUI>
 {
+    private HashSet<Item> _listedItems = new HashSet<Item>();
     internal DismantleItemList() : base(new[] { ItemsTabType.All }) { }
     protected override bool ItemFilter(Item item) => true;
     protected override void Choose(Item item) => ParentModel.Select(item);
@@ -183,8 +189,19 @@ internal sealed class DismantleItemList : ItemChooseUI<DismantleUI>
         _promptSelect = Prompts.AddPrompt(Prompt.VisualOnlyTap(KeyBindings.UI.Items.SelectItem, "Select item",
             Prompt.Position.First, ControlSchemeFlag.Gamepad), this);
     }
-    internal void FocusFirst() => _itemsUI.FocusFirstItem().Forget();
-    internal void Refresh() => _itemsUI.FullRefresh();
+    internal void FocusFirst()
+    {
+        _listedItems = new HashSet<Item>(Items);
+        _itemsUI.FocusFirstItem().Forget();
+    }
+    internal void Refresh()
+    {
+        var current = new HashSet<Item>(Items);
+        // Native rows remove discarded items and observe quantity changes. Rebuild only for new equipment.
+        if (current.Any(item => !_listedItems.Contains(item))) _itemsUI.FullRefresh();
+        else _itemsUI.SoftRefresh();
+        _listedItems = current;
+    }
 }
 
 internal sealed class VDismantleUI : View<DismantleUI>

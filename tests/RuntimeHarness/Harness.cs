@@ -230,6 +230,45 @@ public sealed class Harness : BaseUnityPlugin
                 OpenBench();
                 RunNativeTests();
                 break;
+            case "benchmark":
+                using (var baseline = new InventorySnapshot())
+                {
+                    var timer = System.Diagnostics.Stopwatch.StartNew();
+                    var catalog = new GameCatalog();
+                    double catalogMs = timer.Elapsed.TotalMilliseconds;
+                    Item[] sources = Enumerable.Range(0, 3).Select(_ => Create(Shortsword)).ToArray();
+                    var ui = World.Add(new DismantleUI(catalog));
+                    yield return null;
+                    yield return null;
+                    var samples = new List<object>();
+                    try
+                    {
+                        for (int sample = 0; sample < 3; sample++)
+                        {
+                            Item source = sources[sample];
+                            var nativeList = Field<Awaken.TG.Main.Heroes.CharacterSheet.Items.Panel.ItemsUI>(
+                                Field<DismantleItemList>(ui, "_list"), "_itemsUI")
+                                .Element<Awaken.TG.Main.Heroes.CharacterSheet.Items.Panel.List.ItemsListUI>();
+                            var retained = nativeList.Elements<Awaken.TG.Main.Heroes.CharacterSheet.Items.Panel.List.ItemsListElementUI>()
+                                .GetManagedEnumerator().First(row => row.Item != source);
+                            timer.Restart();
+                            ui.Select(source);
+                            double selectMs = timer.Elapsed.TotalMilliseconds;
+                            timer.Restart();
+                            AccessTools.Method(typeof(DismantleUI), "Confirm").Invoke(ui, null);
+                            double confirmMs = timer.Elapsed.TotalMilliseconds;
+                            Require(source.HasBeenDiscarded && !NativeInventory.Disabled, "Benchmark transaction failed.");
+                            Require(!retained.HasBeenDiscarded, "Unchanged inventory row was rebuilt.");
+                            Require(!nativeList.Elements<Awaken.TG.Main.Heroes.CharacterSheet.Items.Panel.List.ItemsListElementUI>()
+                                .GetManagedEnumerator().Any(row => row.Item == source), "Consumed item row survived.");
+                            samples.Add(new { sample, selectMs, confirmMs });
+                            yield return null;
+                        }
+                        Write("benchmark.json", new { version = typeof(Plugin.Plugin).Assembly.GetName().Version?.ToString(), catalogMs, samples });
+                    }
+                    finally { ui.Close(); }
+                }
+                break;
             case "run-ui-tests":
                 IEnumerator uiTests = RunUiTests();
                 try { while (uiTests.MoveNext()) yield return uiTests.Current; }
@@ -314,6 +353,28 @@ public sealed class Harness : BaseUnityPlugin
                 Item source = Create(Shortsword);
                 var before = new InventorySnapshot();
                 _ = catalog.Quote(source);
+                before.AssertUnchanged();
+            });
+            Case("changed raw recipe rejects confirmation without inventory changes", () =>
+            {
+                Item source = Create(Shortsword);
+                Quote quote = catalog.Quote(source);
+                var definitions = Field<Dictionary<string, Awaken.TG.Main.Crafting.Recipes.BaseRecipe>>(catalog, "_definitions");
+                var ingredientsField = AccessTools.Field(typeof(Awaken.TG.Main.Crafting.Recipes.BaseRecipe), "ingredients");
+                var ingredients = (Array)ingredientsField.GetValue(definitions[quote.Plan.Recipe.Id]);
+                object ingredient = ingredients.GetValue(0)!;
+                var countField = AccessTools.Field(ingredient.GetType(), "count");
+                int count = (int)countField.GetValue(ingredient);
+                var before = new InventorySnapshot();
+                bool rejected = false;
+                try
+                {
+                    countField.SetValue(ingredient, count + 1);
+                    try { NativeInventory.Execute(catalog, quote); }
+                    catch (InvalidOperationException) { rejected = true; }
+                }
+                finally { countField.SetValue(ingredient, count); }
+                Require(rejected, "Changed recipe was accepted.");
                 before.AssertUnchanged();
             });
             Case("positive level includes upgrade materials", () =>
