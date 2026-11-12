@@ -2,7 +2,7 @@
 
 Recover crafting materials from equipment at crafting benches in **Tainted Grail: The Fall of Avalon**.
 
-Version 1.0.1 targets the **1.30.012 Mono build** with **BepInEx 5.4.23.6 x64**. IL2CPP builds are unsupported.
+Version 1.1.0 targets the **1.30.012 Mono build** with **BepInEx 5.4.23.6 x64**. IL2CPP builds are unsupported.
 
 Downloads: [GitHub releases](https://github.com/eugeny-dementev/avalon-dismantling/releases) · [Nexus Mods](https://www.nexusmods.com/taintedgrailthefallofavalon/mods/395)
 
@@ -12,6 +12,21 @@ Downloads: [GitHub releases](https://github.com/eugeny-dementev/avalon-dismantli
 2. Select **Dismantle**.
 3. Select an item and inspect the material ranges.
 4. Hold the displayed confirmation control to dismantle one item or ammunition batch.
+
+Only eligible carried items appear. Equipped, loadout-assigned, favourite, locked, quest, non-droppable, and relic-bearing items stay hidden.
+Items without valid recovery previews and incomplete ammunition batches also stay hidden.
+
+Use **All, Weapons, Armor, Other** to filter by type. Weapons includes shields, arrows, and throwables; Other includes jewelry.
+The type filters reuse the native inventory tab row, category icons, and item-list structure.
+The rarity selector shows the native quality categories available within the selected type. Existing **F** sorting controls remain available.
+Empty filter choices disappear. An unavailable selection resets to All. Each menu opening starts with both filters at All.
+
+**G / Dismantle all** appears only when both type and rarity have specific selections.
+Review the exact items and combined material ranges, then hold the displayed confirmation control.
+Bulk dismantling consumes all matching equipment and complete ammunition batches. It retains ammunition remainders.
+Newly recovered items never join the reviewed queue. Escape/controller Back cancels the review or stops after the current transaction.
+Completed dismantles remain completed after stopping. The result shows actual materials and any remaining work.
+Recovery still rolls separately for every equipment item or ammunition batch.
 
 Dismantling costs zero gold. It grants no crafting XP and triggers no crafting rewards.
 

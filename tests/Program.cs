@@ -62,4 +62,36 @@ Throws<ArgumentOutOfRangeException>(() => new RecoveryPlan(shortsword, 0, Array.
 Throws<ArgumentException>(() => Recipe("invalid", source, 1, Material("iron", -1)), "negative ingredients rejected");
 Throws<ArgumentOutOfRangeException>(() => plan.Roll(() => 49), "invalid random draw rejected");
 Throws<OverflowException>(() => new RecoveryPlan(shortsword, int.MaxValue, Array.Empty<KeyValuePair<string, int>>()), "overflow rejected");
-Console.WriteLine($"PASS: {passed} recovery and matching checks.");
+var filterItems = new[] { new FilterItem("Weapons", "Normal"), new FilterItem("Weapons", "Story"), new FilterItem("Other", "Magic") };
+Check(DismantleFilters.AvailableTypes(filterItems).SequenceEqual(new[] { "All", "Weapons", "Other" }), "only populated type filters");
+Check(DismantleFilters.AvailableRarities(filterItems, "Weapons").SequenceEqual(new[] { "Normal", "Story" }), "rarities constrained by type");
+Check(DismantleFilters.Matches(filterItems[0], "Weapons", "Normal"), "both filters match");
+Check(!DismantleFilters.Matches(filterItems[1], "Weapons", "Normal"), "rarity excludes a different quality");
+Check(!DismantleFilters.Matches(filterItems[2], "Weapons", null), "type excludes jewelry");
+Check(DismantleFilters.Matches(filterItems[2], "All", null), "all filters include eligible candidates");
+Check(DismantleFilters.Normalize(filterItems, "Armor", "Story") == ("All", "Story"), "reset empty type before rarity");
+Check(DismantleFilters.Normalize(filterItems, "Other", "Story") == ("Other", null), "reset missing rarity");
+Check(DismantleFilters.Normalize(Array.Empty<FilterItem>(), "Weapons", "Normal") == ("All", null), "empty inventory resets both");
+Check(DismantleFilters.AvailableTypes(Array.Empty<FilterItem>()).SequenceEqual(new[] { "All" }), "all remains available for empty inventory");
+foreach (string type in new[] { "All", "Weapons" })
+foreach (string? rarity in new string?[] { null, "Normal" })
+    Check(DismantleFilters.BulkAvailable(type, rarity, 1) == (type != "All" && rarity != null), "bulk requires both specific filters");
+Check(!DismantleFilters.BulkAvailable("Weapons", "Normal", 0), "empty result disables bulk");
+Check(DismantleFilters.WholeBatches(25, 10) == 2 && DismantleFilters.WholeBatches(9, 10) == 0, "whole batches leave remainders");
+Throws<ArgumentOutOfRangeException>(() => DismantleFilters.WholeBatches(10, 0), "zero batch size rejected");
+Throws<ArgumentException>(() => new FilterItem("All", "Normal"), "candidate needs concrete type");
+var bulk = new BulkRecovery(new[] { plan, arrowPlan });
+Check(bulk.Consumed == plan.Consumed + arrowPlan.Consumed && bulk.Batches == plan.Batches + arrowPlan.Batches, "bulk quantities aggregate");
+foreach (string ingredient in plan.Maximum.Keys.Union(arrowPlan.Maximum.Keys))
+{
+    int first = plan.Minimum.TryGetValue(ingredient, out int firstMinimum) ? firstMinimum : 0;
+    int second = arrowPlan.Minimum.TryGetValue(ingredient, out int secondMinimum) ? secondMinimum : 0;
+    Check(bulk.Minimum[ingredient] == first + second, "bulk minimum preserves per-entry rounding");
+    int maxFirst = plan.Maximum.TryGetValue(ingredient, out int a) ? a : 0;
+    int maxSecond = arrowPlan.Maximum.TryGetValue(ingredient, out int b) ? b : 0;
+    Check(bulk.Maximum[ingredient] == maxFirst + maxSecond, "bulk maximum merges materials");
+}
+Throws<ArgumentException>(() => new BulkRecovery(Array.Empty<RecoveryPlan>()), "empty bulk plan rejected");
+var huge = new RecoveryPlan(Recipe("huge", source, 1, Material("iron", int.MaxValue)), 1, Array.Empty<KeyValuePair<string, int>>());
+Throws<OverflowException>(() => new BulkRecovery(new[] { huge, huge }), "bulk ranges reject overflow before rolling");
+Console.WriteLine($"PASS: {passed} recovery, matching, filtering, and bulk checks.");

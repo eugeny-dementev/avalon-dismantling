@@ -27,6 +27,7 @@ using Awaken.TG.Main.Templates;
 using Awaken.TG.Main.UI.ButtonSystem;
 using Awaken.TG.Main.UI.TitleScreen;
 using Awaken.TG.Main.UI.TitleScreen.Loading;
+using Awaken.TG.Main.Utility;
 using Awaken.TG.Main.Utility.Patchers;
 using Awaken.TG.Main.Utility.UI;
 using Awaken.TG.MVC;
@@ -60,6 +61,8 @@ public sealed class Harness : BaseUnityPlugin
     private static GameCatalog? FaultCatalog;
     private static Item? FaultExisting;
     private static bool ReentryRejected;
+    private static bool CountRecoveryRolls;
+    private static int RecoveryRollCalls;
     private Harmony? _harmony;
     private bool _ready;
     private bool _nativePatched;
@@ -156,7 +159,7 @@ public sealed class Harness : BaseUnityPlugin
     {
         if (_nativePatched) return;
         Require(HeroReady(), "Native test patches require an initialized hero.");
-        foreach (Type patch in new[] { typeof(NoTestArrowEquip), typeof(NoTestFoodEquip), typeof(InjectInventoryFault) })
+        foreach (Type patch in new[] { typeof(NoTestArrowEquip), typeof(NoTestFoodEquip), typeof(InjectInventoryFault), typeof(ObserveRecoveryRolls) })
             _harmony!.CreateClassProcessor(patch).Patch();
         _nativePatched = true;
         Logger.LogInfo("Native inventory test patches installed after hero initialization.");
@@ -229,6 +232,14 @@ public sealed class Harness : BaseUnityPlugin
             case "run-tests":
                 OpenBench();
                 RunNativeTests();
+                break;
+            case "run-bulk-tests":
+                RunBulkTests();
+                break;
+            case "benchmark-bulk":
+                IEnumerator bulkBenchmark = RunBulkBenchmark();
+                try { while (bulkBenchmark.MoveNext()) yield return bulkBenchmark.Current; }
+                finally { (bulkBenchmark as IDisposable)?.Dispose(); }
                 break;
             case "benchmark":
                 using (var baseline = new InventorySnapshot())
@@ -559,6 +570,384 @@ public sealed class Harness : BaseUnityPlugin
 
     private static T Field<T>(object owner, string name) => (T)(AccessTools.Field(owner.GetType(), name).GetValue(owner)
         ?? throw new InvalidOperationException("Missing runtime fixture field: " + name));
+
+    private void RunBulkTests()
+    {
+        Require(!World.HasAny<DismantleUI>() && !World.HasAny<CraftingTabsUI>(), "Run close-bench before bulk regression tests.");
+        var results = new List<TestResult>();
+        var catalog = new GameCatalog();
+        Testing = true;
+        CountRecoveryRolls = true;
+        try
+        {
+            Case("eligible filters exclude protected sources and use native categories", fixture =>
+            {
+                Item sword = Create(Shortsword);
+                Create(CopperArrows, 25);
+                Create(CopperArrows, 9);
+                Create(Hammer);
+                var outcomes = Field<Dictionary<string, ItemTemplate>>(catalog, "_outcomes").Values;
+                Create(outcomes.First(template => template.IsArmor).GUID);
+                Create(outcomes.First(template => template.IsJewelry).GUID);
+                Item favourite = Create(Shortsword);
+                favourite.ToggleFavourite();
+                Create(Shortsword).AddElement(new LockItemSlot());
+                Item relicSource = Create(Shortsword);
+                AttachSyntheticRelic(relicSource);
+                DismantleUI ui = fixture.Open(catalog);
+                Item[] eligible = Hero.Current.HeroItems.Inventory.Where(item => catalog.Eligibility(item) == null).ToArray();
+                Require(new HashSet<Item>(ui.PossibleItems).SetEquals(eligible), "Eligible snapshot includes protected items or omits valid items.");
+                foreach (string type in new[] { "Weapons", "Armor", "Other" })
+                {
+                    ui.ChangeType(type);
+                    Require(ui.SelectedType == type && new HashSet<Item>(ui.PossibleItems).SetEquals(eligible.Where(item => TestType(item) == type)),
+                        "Native category filter differs from the eligible inventory: " + type);
+                }
+                ui.ChangeType("Weapons");
+                ui.SetRarity(sword.Quality);
+                Require(ui.PossibleItems.All(item => TestType(item) == "Weapons" && item.Quality == sword.Quality), "Type and rarity filters are not combined.");
+                ui.Select(favourite);
+                Require(!Field<Prompt>(ui, "_confirm").IsActive, "Direct selection bypassed favourite protection.");
+            });
+            Case("CraftMany gate and rarity normalization", fixture =>
+            {
+                Item source = Create(Shortsword);
+                Item hammer = Create(Hammer);
+                Create(Field<Dictionary<string, ItemTemplate>>(catalog, "_outcomes").Values.First(template => template.IsArmor).GUID);
+                DismantleUI ui = fixture.Open(catalog);
+                Prompt bulk = ui.Prompts.Elements<Prompt>().GetManagedEnumerator()
+                    .First(prompt => ReferenceEquals(Field<KeyBindings>(prompt, "_key"), KeyBindings.UI.Crafting.CraftMany));
+                Require(!ui.BulkAvailable && !bulk.IsActive, "All types enabled bulk dismantling.");
+                ui.SetRarity(source.Quality);
+                Require(!ui.BulkAvailable && !bulk.IsActive, "A rarity alone enabled bulk dismantling.");
+                ui.ChangeType("Weapons");
+                Require(ui.BulkAvailable && bulk.IsActive, "Specific type and rarity did not enable bulk dismantling.");
+                ui.SetRarity(null);
+                Require(!ui.BulkAvailable && !bulk.IsActive, "All rarities enabled bulk dismantling.");
+                ItemQuality[] rarities = ui.PossibleItems.Select(item => item.Quality).Distinct().OrderBy(quality => quality.Priority).ToArray();
+                foreach (ItemQuality quality in rarities)
+                {
+                    ui.CycleRarity();
+                    Require(ui.SelectedRarity == quality, "Rarity cycling does not follow native priority.");
+                }
+                ui.CycleRarity();
+                Require(ui.SelectedRarity == null, "Rarity cycling did not return to All.");
+                Require(hammer.Quality != source.Quality, "Rarity normalization fixture requires two weapon qualities.");
+                ui.SetRarity(hammer.Quality);
+                hammer.AddElement(new LockItemSlot());
+                ui.RebuildSnapshot();
+                Require(ui.SelectedType == "Weapons" && ui.SelectedRarity == null, "An emptied rarity was not reset while its type remained available.");
+                source.AddElement(new LockItemSlot());
+                ui.RebuildSnapshot();
+                Require(ui.SelectedType == "All" && ui.SelectedRarity == null, "An emptied type was not reset to All before rarity normalization.");
+            });
+            Case("unsupported upgrade estimate stays outside the eligible snapshot", fixture =>
+            {
+                Item excessive = Create(Shortsword);
+                excessive.Level.IncreaseBy(1001);
+                Item valid = Create(Shortsword);
+                DismantleUI ui = fixture.Open(catalog);
+                Require(excessive.ModifiedLevelWithoutNewGamePlus > 1000 && !ui.PossibleItems.Contains(excessive) && ui.PossibleItems.Contains(valid),
+                    "Unsupported upgrade estimate was listed or a valid source disappeared.");
+                var before = new InventorySnapshot();
+                ui.Select(excessive);
+                Require(!Field<Prompt>(ui, "_confirm").IsActive && RecoveryRollCalls == 0, "Unsupported direct selection enabled confirmation or rolled recovery.");
+                before.AssertUnchanged();
+            });
+            Case("bulk review freezes full batches without rolling or consuming", fixture =>
+            {
+                Item arrows = Create(CopperArrows, 25);
+                DismantleUI ui = fixture.Open(catalog);
+                SelectBulk(ui, arrows);
+                var before = new InventorySnapshot();
+                ui.OpenBulkReview();
+                Require(ui.BulkReviewing && ui.BulkReviewEntries.Length == 1 && ui.BulkReviewEntries[0].Plan.Consumed == 20,
+                    "Review did not capture complete ammunition batches.");
+                Require(ui.BulkReviewEntries[0].Plan.Batches == 2 && RecoveryRollCalls == 0, "Review rolled recovery or lost a batch.");
+                before.AssertUnchanged();
+                ui.Close();
+                Require(!ui.BulkReviewing && !ui.BulkProcessing && !ui.HasBeenDiscarded && RecoveryRollCalls == 0,
+                    "Cancelling review discarded the menu or rolled recovery.");
+                before.AssertUnchanged();
+            });
+            Case("bulk completion keeps ammo remainder and ignores repeated confirmation", fixture =>
+            {
+                Item remainder = Create(CopperArrows, 25);
+                Create(CopperArrows, 30);
+                DismantleUI ui = fixture.Open(catalog);
+                SelectBulk(ui, remainder);
+                ui.OpenBulkReview();
+                Quote[] entries = ui.BulkReviewEntries.ToArray();
+                Require(entries.Length == 2 && entries.Sum(entry => entry.Plan.Consumed) == 50, "Review omitted a full ammunition stack.");
+                var minima = Recovery.Merge(entries.SelectMany(entry => entry.Plan.Minimum));
+                var maxima = Recovery.Merge(entries.SelectMany(entry => entry.Plan.Maximum));
+                var counts = maxima.Keys.ToDictionary(id => id, id => CleanCount(catalog.Material(id)));
+                float gold = Hero.Current.Wealth.BaseValue;
+                InvokeConfirm(ui);
+                InvokeConfirm(ui);
+                Require(ui.BulkProcessing && ui.BulkCompleted == 0 && RecoveryRollCalls == 0, "Confirm consumed inventory before a queue tick.");
+                FinishBulk(ui, entries.Length);
+                Require(ui.BulkCompleted == entries.Length && RecoveryRollCalls == entries.Length, "Queue consumed entries more than once.");
+                Require(remainder.Quantity == 5 && !remainder.HasBeenDiscarded, "Bulk dismantling lost the incomplete ammunition remainder.");
+                foreach (var count in counts)
+                {
+                    int delta = CleanCount(catalog.Material(count.Key)) - count.Value;
+                    Require(delta >= minima[count.Key] && delta <= maxima[count.Key], "Bulk material delta exceeds the review range.");
+                }
+                Require(Hero.Current.Wealth.BaseValue == gold, "Bulk dismantling changed gold.");
+                var completed = new InventorySnapshot();
+                InvokeConfirm(ui);
+                ui.Tick();
+                completed.AssertUnchanged();
+            });
+            Case("changed raw recipe stops preflight before the first source", fixture =>
+            {
+                Item source = Create(Shortsword);
+                Create(Shortsword);
+                DismantleUI ui = fixture.Open(catalog);
+                SelectBulk(ui, source);
+                ui.OpenBulkReview();
+                Quote entry = ui.BulkReviewEntries[0];
+                var before = new InventorySnapshot();
+                using (var change = new RecipeFixture(catalog, entry, selfIngredient: false))
+                {
+                    InvokeConfirm(ui);
+                    ui.Tick();
+                    Require(!ui.BulkProcessing && ui.BulkCompleted == 0 && RecoveryRollCalls == 0, "Changed raw recipe passed bulk preflight.");
+                    before.AssertUnchanged();
+                }
+            });
+            Case("mid-queue protection stops remaining sources", fixture =>
+            {
+                Item source = Create(Shortsword);
+                Create(Shortsword);
+                Create(Shortsword);
+                DismantleUI ui = fixture.Open(catalog);
+                SelectBulk(ui, source);
+                ui.OpenBulkReview();
+                Quote[] entries = ui.BulkReviewEntries.ToArray();
+                InvokeConfirm(ui);
+                ui.Tick();
+                Require(ui.BulkCompleted == 1, "First queue tick did not complete exactly one source.");
+                entries[1].Source.AddElement(new LockItemSlot());
+                ui.Tick();
+                ui.Tick();
+                Require(!ui.BulkProcessing && ui.BulkCompleted == 1 && RecoveryRollCalls == 1, "Queue continued after a source became locked.");
+                Require(entries[0].Source.HasBeenDiscarded && entries.Skip(1).All(entry => !entry.Source.HasBeenDiscarded && entry.Source.Quantity == entry.SourceQuantity),
+                    "A queued source changed after the protection failure.");
+            });
+            Case("disabled inventory stops between entries without another roll", fixture =>
+            {
+                Item source = Create(Shortsword);
+                Create(Shortsword);
+                Create(Shortsword);
+                DismantleUI ui = fixture.Open(catalog);
+                SelectBulk(ui, source);
+                ui.OpenBulkReview();
+                Quote[] entries = ui.BulkReviewEntries.ToArray();
+                InvokeConfirm(ui);
+                ui.Tick();
+                Require(ui.BulkCompleted == 1 && RecoveryRollCalls == 1, "Fixture did not complete its first source.");
+                var completed = new InventorySnapshot();
+                FieldInfo disabled = AccessTools.Field(typeof(NativeInventory), "<Disabled>k__BackingField");
+                bool previous = NativeInventory.Disabled;
+                try
+                {
+                    disabled.SetValue(null, true);
+                    ui.Tick();
+                    ui.Tick();
+                    Require(!ui.BulkProcessing && ui.BulkCompleted == 1 && RecoveryRollCalls == 1,
+                        "Disabled inventory processed another source or lost completed progress.");
+                    Require(entries[0].Source.HasBeenDiscarded && entries.Skip(1).All(entry => !entry.Source.HasBeenDiscarded && entry.Source.Quantity == entry.SourceQuantity),
+                        "Disabled inventory changed a remaining source.");
+                    completed.AssertUnchanged();
+                }
+                finally { disabled.SetValue(null, previous); }
+            });
+            Case("cancellation between entries preserves completed recovery", fixture =>
+            {
+                Item source = Create(Shortsword);
+                Create(Shortsword);
+                Create(Shortsword);
+                DismantleUI ui = fixture.Open(catalog);
+                SelectBulk(ui, source);
+                ui.OpenBulkReview();
+                Quote[] entries = ui.BulkReviewEntries.ToArray();
+                InvokeConfirm(ui);
+                ui.Tick();
+                var completed = new InventorySnapshot();
+                ui.Close();
+                ui.Tick();
+                Require(!ui.BulkProcessing && ui.BulkCompleted == 1 && RecoveryRollCalls == 1, "Cancellation processed another source or lost its completion count.");
+                Require(entries.Skip(1).All(entry => !entry.Source.HasBeenDiscarded), "Cancellation consumed a remaining source.");
+                completed.AssertUnchanged();
+            });
+            Case("rejected material delivery stops and rolls back one bulk entry", fixture =>
+            {
+                Item source = Create(Shortsword);
+                Create(Shortsword);
+                DismantleUI ui = fixture.Open(catalog);
+                SelectBulk(ui, source);
+                ui.OpenBulkReview();
+                Quote first = ui.BulkReviewEntries[0];
+                var before = new InventorySnapshot();
+                InvokeConfirm(ui);
+                SetFault(Fault.Reject, catalog, first);
+                ui.Tick();
+                ui.Tick();
+                Require(FaultTriggered && !ui.BulkProcessing && ui.BulkCompleted == 0 && !NativeInventory.Disabled,
+                    "Rejected material delivery did not stop the bulk operation safely.");
+                before.AssertUnchanged();
+            });
+            Case("newly recovered eligible equipment never joins the frozen queue", fixture =>
+            {
+                Item source = Create(Shortsword);
+                Quote original = catalog.Quote(source);
+                using (var change = new RecipeFixture(catalog, original, selfIngredient: true))
+                {
+                    var selfCatalog = new GameCatalog();
+                    DismantleUI ui = fixture.Open(selfCatalog);
+                    SelectBulk(ui, source);
+                    ui.OpenBulkReview();
+                    Require(ui.BulkReviewEntries.Length == 1 && ui.BulkReviewEntries[0].Plan.Maximum[Shortsword] == 1,
+                        "Self-returning equipment fixture did not enter the review.");
+                    var existing = new HashSet<Item>(Hero.Current.HeroItems.Inventory);
+                    InvokeConfirm(ui);
+                    FinishBulk(ui, 1);
+                    Item[] recovered = Hero.Current.HeroItems.Inventory.Where(item => !existing.Contains(item) && item.Template.GUID == Shortsword).ToArray();
+                    Require(source.HasBeenDiscarded && recovered.Length == 1 && !ReferenceEquals(source, recovered[0]) &&
+                        !recovered[0].IsStolen && !recovered[0].Locked && !recovered[0].HasBeenDiscarded && selfCatalog.Eligibility(recovered[0]) == null,
+                        "Self-returning source did not become a new clean eligible inventory item.");
+                    Require(ui.BulkCompleted == 1 && RecoveryRollCalls == 1 && !ui.BulkProcessing, "Recovered equipment extended the queue.");
+                    var finished = new InventorySnapshot();
+                    ui.Tick();
+                    finished.AssertUnchanged();
+                }
+            });
+        }
+        finally
+        {
+            FaultMode = Fault.None;
+            CountRecoveryRolls = false;
+            Testing = false;
+            Write("bulk-tests.json", new { utc = DateTime.UtcNow, results,
+                passed = results.Count(result => result.Status == "passed"), failed = results.Count(result => result.Status == "failed"),
+                detail = "Synthetic queues only; original eligible copied-profile items temporarily locked. Explicit controller ticks; no physical input." });
+        }
+        Require(results.All(result => result.Status != "failed"), "Bulk regression tests failed. Read bulk-tests.json.");
+
+        void Case(string name, Action<BulkFixture> action)
+        {
+            RecoveryRollCalls = 0;
+            if (NativeInventory.Disabled) { results.Add(new TestResult(name, "skipped", "Inventory feature was disabled.")); return; }
+            try
+            {
+                using (var fixture = new BulkFixture(catalog)) action(fixture);
+                results.Add(new TestResult(name, "passed", ""));
+            }
+            catch (Exception exception) { results.Add(new TestResult(name, "failed", exception.ToString())); }
+            finally { FaultMode = Fault.None; }
+        }
+    }
+
+    private IEnumerator RunBulkBenchmark()
+    {
+        Require(!World.HasAny<DismantleUI>() && !World.HasAny<CraftingTabsUI>(), "Run close-bench before benchmark-bulk.");
+        var samples = new List<object>();
+        double reviewMs = 0;
+        double totalMs = 0;
+        int completed = 0;
+        int consumed = 0;
+        Testing = true;
+        CountRecoveryRolls = true;
+        RecoveryRollCalls = 0;
+        try
+        {
+            var catalog = new GameCatalog();
+            using var fixture = new BulkFixture(catalog);
+            Item arrows = Create(CopperArrows, 100);
+            ItemTemplate equipment = Field<Dictionary<string, ItemTemplate>>(catalog, "_outcomes").Values
+                .Where(template => !template.CanStack && template.Quality == arrows.Quality &&
+                    (template.IsMelee || template.IsShield || template.IsShortBow || template.IsMediumBow || template.IsHeavyBow))
+                .OrderBy(template => template.GUID, StringComparer.Ordinal).First();
+            for (int index = 0; index < 10; index++) Create(equipment.GUID);
+            DismantleUI ui = fixture.Open(catalog);
+            SelectBulk(ui, arrows);
+            yield return null;
+            yield return null;
+            var timer = System.Diagnostics.Stopwatch.StartNew();
+            ui.OpenBulkReview();
+            reviewMs = timer.Elapsed.TotalMilliseconds;
+            Quote[] entries = ui.BulkReviewEntries.ToArray();
+            Require(entries.Length == 11 && entries.Single(entry => ReferenceEquals(entry.Source, arrows)).Plan.Consumed == 100,
+                "Bulk benchmark did not capture ten equipment items and the complete ammunition stack.");
+            var nativeList = Field<Awaken.TG.Main.Heroes.CharacterSheet.Items.Panel.ItemsUI>(Field<DismantleItemList>(ui, "_list"), "_itemsUI")
+                .Element<Awaken.TG.Main.Heroes.CharacterSheet.Items.Panel.List.ItemsListUI>();
+            var rows = nativeList.Elements<Awaken.TG.Main.Heroes.CharacterSheet.Items.Panel.List.ItemsListElementUI>()
+                .GetManagedEnumerator().ToDictionary(row => row.Item, row => row);
+            Require(entries.All(entry => rows.ContainsKey(entry.Source)), "Native benchmark rows are not initialized.");
+            var total = System.Diagnostics.Stopwatch.StartNew();
+            InvokeConfirm(ui);
+            for (int tick = 0; ui.BulkProcessing && tick <= entries.Length + 1; tick++)
+            {
+                int previous = ui.BulkCompleted;
+                timer.Restart();
+                ui.Tick();
+                double tickMs = timer.Elapsed.TotalMilliseconds;
+                Require(ui.BulkCompleted >= previous && ui.BulkCompleted <= previous + 1, "One tick completed multiple queue entries.");
+                Require(!nativeList.HasBeenDiscarded, "Bulk processing rebuilt the native inventory list.");
+                Require(entries.Skip(ui.BulkCompleted).All(entry => !rows[entry.Source].HasBeenDiscarded),
+                    "An unchanged pending row was rebuilt during bulk processing.");
+                if (ui.BulkCompleted > previous)
+                    Require(rows[entries[previous].Source].HasBeenDiscarded, "Consumed source retained its native inventory row.");
+                samples.Add(new { tick, completed = ui.BulkCompleted, tickMs });
+                yield return null;
+            }
+            totalMs = total.Elapsed.TotalMilliseconds;
+            completed = ui.BulkCompleted;
+            consumed = entries.Sum(entry => entry.Plan.Consumed);
+            Require(!ui.BulkProcessing && completed == entries.Length && RecoveryRollCalls == entries.Length && !NativeInventory.Disabled,
+                "Bulk benchmark did not complete its frozen queue exactly once.");
+        }
+        finally
+        {
+            CountRecoveryRolls = false;
+            Testing = false;
+        }
+        Write("bulk-benchmark.json", new { status = "passed", version = typeof(Plugin.Plugin).Assembly.GetName().Version?.ToString(),
+            entries = completed, units = consumed, reviewMs, totalMs, samples,
+            detail = "Ten synthetic equipment items plus 100 arrows. Explicit ticks with native UI updates; total includes yielded render frames. Pending row identities preserved." });
+    }
+
+    private static string TestType(Item item) => item.Template.IsArmor ? "Armor" :
+        item.Template.IsMelee || item.Template.IsShield || item.Template.IsArrow || item.Template.IsThrowable ||
+        item.Template.IsShortBow || item.Template.IsMediumBow || item.Template.IsHeavyBow ? "Weapons" : "Other";
+
+    private static void SelectBulk(DismantleUI ui, Item source)
+    {
+        ui.ChangeType(TestType(source));
+        ui.SetRarity(source.Quality);
+        Require(ui.BulkAvailable, "Synthetic filter selection did not enable bulk review.");
+    }
+
+    private static void InvokeConfirm(DismantleUI ui) => AccessTools.Method(typeof(DismantleUI), "Confirm").Invoke(ui, null);
+
+    private static void FinishBulk(DismantleUI ui, int expectedEntries)
+    {
+        for (int tick = 0; ui.BulkProcessing && tick <= expectedEntries + 1; tick++) ui.Tick();
+        Require(!ui.BulkProcessing && !NativeInventory.Disabled, "Bulk operation did not stop within its frozen queue length.");
+    }
+
+    private static void AttachSyntheticRelic(Item source)
+    {
+        ItemTemplate template = World.Services.Get<TemplatesProvider>().GetAllOfType<ItemTemplate>(TemplateTypeFlag.Regular)
+            .Where(item => !item.IsAbstract && item.GetAttachment<GemAttachment>()?.Type == GemType.Weapon)
+            .OrderBy(item => item.GUID, StringComparer.Ordinal).First();
+        Item gem = Create(template.GUID);
+        ItemGems sockets = source.TryGetElement<ItemGems>() ?? source.AddElement(new ItemGems(1, source.MaxGemSlots));
+        if (!sockets.CanAttach) sockets.IncreaseLimit();
+        Require(sockets.AttachGem(gem) != null && source.HasGemAttached, "Synthetic relic could not attach through native item sockets.");
+    }
 
     private IEnumerator RunUiTests()
     {
@@ -1006,6 +1395,73 @@ public sealed class Harness : BaseUnityPlugin
         public float Cobweb { get; set; }
     }
 
+    private sealed class BulkFixture : IDisposable
+    {
+        private readonly InventorySnapshot _snapshot = new InventorySnapshot();
+        private readonly List<LockItemSlot> _locks = new List<LockItemSlot>();
+        private DismantleUI? _ui;
+
+        public BulkFixture(GameCatalog catalog)
+        {
+            try
+            {
+                foreach (Item item in Hero.Current.HeroItems.Inventory.Where(item => catalog.Eligibility(item) == null).ToArray())
+                    _locks.Add(item.AddElement(new LockItemSlot()));
+            }
+            catch { Dispose(); throw; }
+        }
+
+        public DismantleUI Open(GameCatalog catalog)
+        {
+            Require(_ui == null, "A bulk fixture can own only one menu.");
+            _ui = World.Add(new DismantleUI(catalog));
+            Field<VDismantleUI>(_ui, "_view").enabled = false;
+            return _ui;
+        }
+
+        public void Dispose()
+        {
+            try { if (_ui != null && !_ui.HasBeenDiscarded) _ui.Discard(); }
+            finally
+            {
+                try { foreach (LockItemSlot itemLock in _locks) if (!itemLock.HasBeenDiscarded) itemLock.Discard(); }
+                finally { _snapshot.Dispose(); }
+            }
+        }
+    }
+
+    private sealed class RecipeFixture : IDisposable
+    {
+        private readonly Awaken.TG.Main.Crafting.Recipes.BaseRecipe _definition;
+        private readonly FieldInfo _ingredients = AccessTools.Field(typeof(Awaken.TG.Main.Crafting.Recipes.BaseRecipe), "ingredients");
+        private readonly Awaken.TG.Main.Crafting.Recipes.Ingredient[] _original;
+
+        public RecipeFixture(GameCatalog catalog, Quote quote, bool selfIngredient)
+        {
+            _definition = Field<Dictionary<string, Awaken.TG.Main.Crafting.Recipes.BaseRecipe>>(catalog, "_definitions")[quote.Plan.Recipe.Id];
+            _original = (Awaken.TG.Main.Crafting.Recipes.Ingredient[])_ingredients.GetValue(_definition);
+            var count = AccessTools.Field(typeof(Awaken.TG.Main.Crafting.Recipes.Ingredient), "count");
+            if (selfIngredient)
+            {
+                var ingredient = new Awaken.TG.Main.Crafting.Recipes.Ingredient { templateReference = new TemplateReference(quote.Source.Template) };
+                count.SetValue(ingredient, 1);
+                _ingredients.SetValue(_definition, new[] { ingredient });
+            }
+            else
+            {
+                var changed = _original.ToArray();
+                int index = Array.FindIndex(changed, ingredient => ingredient.Template.GetAttachment<CurrencyAsCraftingIngredientAttachment>()?.Type != CurrencyType.Money);
+                Require(index >= 0, "Recipe has no material ingredient to change.");
+                var ingredient = new Awaken.TG.Main.Crafting.Recipes.Ingredient { templateReference = changed[index].templateReference };
+                count.SetValue(ingredient, checked((int)count.GetValue(changed[index]) + 1));
+                changed[index] = ingredient;
+                _ingredients.SetValue(_definition, changed);
+            }
+        }
+
+        public void Dispose() => _ingredients.SetValue(_definition, _original);
+    }
+
     private sealed class InventorySnapshot : IDisposable
     {
         private readonly HeroItems _inventory = Hero.Current.HeroItems;
@@ -1113,6 +1569,12 @@ public sealed class Harness : BaseUnityPlugin
 
     [HarmonyPatch(typeof(HeroItems), "EquipPickedFood")]
     private static class NoTestFoodEquip { private static bool Prefix() => !Testing; }
+
+    [HarmonyPatch(typeof(RecoveryPlan), nameof(RecoveryPlan.Roll))]
+    private static class ObserveRecoveryRolls
+    {
+        private static void Prefix() { if (CountRecoveryRolls) RecoveryRollCalls++; }
+    }
 
     [HarmonyPatch(typeof(HeroItems), nameof(HeroItems.Add))]
     private static class InjectInventoryFault

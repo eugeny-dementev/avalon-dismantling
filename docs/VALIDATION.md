@@ -4,6 +4,45 @@ Target: Tainted Grail: The Fall of Avalon 1.30.012 Mono, BepInEx 5.4.23.6, Unity
 
 ## Completed
 
+### 1.1.0 filters and bulk dismantling
+
+Tested on November 12, 2026, using an isolated copy of the latest bench save, Slot 76.
+The test process uses separate save storage and cache paths. The release contains no test harness.
+
+- Independent calculation, matching, filtering, and aggregation checks: 152 passed.
+- Native inventory cases: 22 passed, zero failed, zero skipped.
+- Bulk and eligibility cases: 11 passed, zero failed.
+- Native prompt and menu cases: five passed, zero failed.
+- Plugin and runtime-harness compilation: zero warnings and zero errors.
+
+Bulk cases cover every protection restriction, invalid quotes, type/rarity intersections, dynamic choices, and the two-filter Craft Many gate.
+They cover review cancellation, repeated confirmation, recipe changes, mid-queue protection changes, partial cancellation, rejected delivery, rollback, and disabled inventory.
+Complete ammunition batches preserve remainders. Recovery outputs never join the frozen queue.
+The tests inspect native inventory changes, wallet balances, recovery calls, and pending row identities.
+
+An isolated save/reload preserves recovered materials and both currency balances.
+Normal handcrafting opens and selects a learned recipe after Dismantle closes, without changing inventory or gold.
+Visual checks cover 1920 × 1080 and 3840 × 2160 rendering.
+Mouse category and rarity selection, keyboard category navigation, F sorting, G review, scrollbar dragging, and Escape cancellation work.
+Eligible purple equipment and jewelry remain visible under their native quality filter.
+Choosing All removes G, and pressing G then leaves the ordinary item list open.
+Confirmation holds were checked through native prompt events and callbacks; physical held-key duration was not tested.
+Normal startup reaches the main menu after removing the temporary harness. The release startup log contains no Avalon Dismantling errors.
+All 63 original profile files match the backup after testing. The original saves were never overwritten.
+
+| Measurement | 1.0.1 baseline | 1.1.0 |
+| --- | --- | --- |
+| Single confirmation processing, three samples | 212–273 ms | 336–446 ms |
+| Bulk review, 11 entries | Not available | 55 ms |
+| Bulk processing, 11 entries / 110 units | Not available | 2341 ms |
+| Individual bulk transaction ticks | Not available | 159–245 ms |
+
+Timings exclude the 0.65-second confirmation hold. Bulk elapsed time includes yielded render frames and final refresh.
+The baseline uses the earlier 1.0.1 benchmark on this machine. Inventory contents and runtime load can affect these measurements.
+The new single-item path also refreshes eligibility and filter choices. It retains the incremental row update from 1.0.1.
+The bulk benchmark consumes ten synthetic equipment items and 100 arrows in 11 inventory entries.
+It checks unchanged row identities throughout processing and avoids rebuilding the full list between transactions.
+
 ### 1.0.1 performance regression check
 
 Tested against a copy of the latest bench save, Slot 72, with the installed mod collection.

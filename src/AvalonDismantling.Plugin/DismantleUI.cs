@@ -1,12 +1,15 @@
 using System;
 using System.Collections.Generic;
 using System.Linq;
+using AvalonDismantling.Core;
+using Awaken.TG.Main.Character;
 using Awaken.TG.MVC;
 using Awaken.TG.MVC.Domains;
 using Awaken.TG.MVC.UI.Handlers.States;
 using Awaken.TG.MVC.UI.Universal;
 using Awaken.TG.Main.Heroes;
 using Awaken.TG.Main.Heroes.CharacterSheet.Items.Choose;
+using Awaken.TG.Main.Heroes.CharacterSheet.Items.Panel.List;
 using Awaken.TG.Main.Heroes.CharacterSheet.Items.Panel.Slot;
 using Awaken.TG.Main.Heroes.CharacterSheet.Items.Panel.Tabs;
 using Awaken.TG.Main.Heroes.Items;
@@ -22,6 +25,7 @@ using Awaken.TG.Main.Utility.UI;
 using Awaken.TG.Main.Utility.UI.Keys;
 using Awaken.TG.Utility;
 using Awaken.Utility.Animations;
+using Awaken.Utility.Collections;
 using TMPro;
 using UnityEngine;
 using UnityEngine.UI;
@@ -31,11 +35,28 @@ namespace AvalonDismantling.Plugin;
 
 internal sealed class DismantleUI : Model, IUIStateSource, IItemChooseParent, IPromptHost, IClosable
 {
-    private readonly GameCatalog _catalog;
+    private GameCatalog _catalog;
     private VDismantleUI _view = null!;
     private DismantleItemList _list = null!;
     private ItemTooltipUI _tooltip = null!;
     private Prompt _confirm = null!;
+    private Prompt _bulkPrompt = null!;
+    private Prompt _back = null!;
+    private readonly Dictionary<Item, Quote> _eligible = new Dictionary<Item, Quote>();
+    private readonly HashSet<Item> _observed = new HashSet<Item>();
+    private Item[] _visible = Array.Empty<Item>();
+    private BulkEntry[] _review = Array.Empty<BulkEntry>();
+    private readonly Dictionary<string, int> _bulkReturns = new Dictionary<string, int>(StringComparer.Ordinal);
+    private bool _dirty;
+    private bool _cancelRequested;
+    internal string SelectedType { get; private set; } = "All";
+    internal ItemQuality? SelectedRarity { get; private set; }
+    internal bool BulkReviewing { get; private set; }
+    internal bool BulkProcessing { get; private set; }
+    internal int BulkCompleted { get; private set; }
+    internal Quote[] BulkReviewEntries => _review.Select(entry => entry.Quote).ToArray();
+    internal bool BulkAvailable => !_busy && !BulkReviewing &&
+        DismantleFilters.BulkAvailable(SelectedType, SelectedRarity?.EnumName, _visible.Length);
     private Item? _selected;
     private ExistingItemDescriptor? _selectedDescriptor;
     private Quote? _quote;
@@ -45,7 +66,7 @@ internal sealed class DismantleUI : Model, IUIStateSource, IItemChooseParent, IP
     public override Domain DefaultDomain => Domain.Gameplay;
     public override bool IsNotSaved => true;
     public UIState UIState => UIState.ModalState(HUDState.EverythingHidden).WithPauseTime();
-    public IEnumerable<Item> PossibleItems => Hero.Current.HeroItems.Items.Where(item => !item.HiddenOnUI && GameCatalog.IsSupported(item.Template));
+    public IEnumerable<Item> PossibleItems => _visible;
     public Transform ChooseHost => _view.InventoryHost;
     public Transform PromptsHost => _view.FooterHost;
     public Prompts Prompts { get; private set; } = null!;
@@ -76,20 +97,270 @@ internal sealed class DismantleUI : Model, IUIStateSource, IItemChooseParent, IP
     protected override void OnFullyInitialized()
     {
         Prompts = AddElement(new Prompts(this));
-        Prompts.AddPrompt(Prompt.Tap(KeyBindings.UI.Generic.Cancel, "Back", Close, Prompt.Position.Last), this);
+        _back = Prompts.AddPrompt(Prompt.Tap(KeyBindings.UI.Generic.Cancel, "Back", Close, Prompt.Position.Last), this);
         _confirm = Prompts.BindPrompt(Prompt.Hold(KeyBindings.UI.Crafting.CraftOne, "Dismantle", Confirm,
             holdTime: 0.65f), this, _view.ConfirmView, active: false);
         _tooltip = AddElement(new ItemTooltipUI(typeof(VStaticSingleItemTooltipSystemUI), _view.TooltipHost,
             isStatic: true, comparerActive: false, prompts: Prompts));
+        _bulkPrompt = Prompts.AddPrompt(Prompt.Tap(KeyBindings.UI.Crafting.CraftMany, "Dismantle all", OpenBulkReview), this);
+        ModelExtensions.ListenTo(Hero.Current.HeroItems, Model.Events.AfterChanged, MarkDirty, this);
+        ModelExtensions.ListenTo(Hero.Current.HeroItems, ICharacterInventory.Events.AfterEquipmentChanged, MarkDirty, this);
+        ModelExtensions.ListenTo(Hero.Current.HeroItems, ICharacterInventory.Events.PickedUpItem, MarkDirty, this);
+        RebuildSnapshot();
         _list = AddElement(new DismantleItemList());
         _view.SetStatus(_selected != null ? "" : PossibleItems.Any()
-            ? "Select an item to see material recovery." : "No equipment or ammunition in your inventory.");
+            ? "Select an item to see material recovery." : "No items available to dismantle.");
         _list.FocusFirst();
+    }
+
+    internal static string Category(Item item) => item.IsArmor ? "Armor" :
+        item.Template.IsMelee || item.IsShield || item.IsArrow || item.IsThrowable ||
+        item.Template.IsShortBow || item.Template.IsMediumBow || item.Template.IsHeavyBow ? "Weapons" : "Other";
+
+    private static FilterItem FilterValue(Item item) => new FilterItem(Category(item), item.Quality.EnumName);
+    private void MarkDirty() => _dirty = true;
+
+    internal void RebuildSnapshot()
+    {
+        if (_busy) { _dirty = true; return; }
+        _dirty = false;
+        _eligible.Clear();
+        foreach (Item item in Hero.Current.HeroItems.Items.ToArray())
+        {
+            if (_observed.Add(item))
+            {
+                ModelExtensions.ListenTo(item, Model.Events.AfterChanged, MarkDirty, this);
+                ModelExtensions.ListenTo(item, Model.Events.AfterElementsCollectionModified, MarkDirty, this);
+                ModelExtensions.ListenTo(item, Model.Events.AfterDiscarded, MarkDirty, this);
+                ModelExtensions.ListenTo(item, Item.Events.FavouriteChanged, MarkDirty, this);
+                ModelExtensions.ListenTo(item, Item.Events.QuantityChanged, MarkDirty, this);
+            }
+            try
+            {
+                if (_catalog.Eligibility(item) != null) continue;
+                Quote quote = _catalog.Quote(item);
+                _catalog.Revalidate(quote.Plan.Recipe);
+                _eligible.Add(item, quote);
+            }
+            catch (Exception error) when (error is InvalidOperationException || error is ArgumentException || error is OverflowException)
+            { /* An unavailable quote is excluded from this temporary menu snapshot. */ }
+        }
+        ApplyFilters(false);
+    }
+
+    private void ApplyFilters(bool forceRebuild)
+    {
+        Item[] old = _visible;
+        var values = _eligible.Keys.Select(FilterValue).ToArray();
+        var normalized = DismantleFilters.Normalize(values, SelectedType, SelectedRarity?.EnumName);
+        SelectedType = normalized.Type;
+        SelectedRarity = normalized.Rarity == null ? null : _eligible.Keys.Select(item => item.Quality)
+            .First(quality => quality.EnumName == normalized.Rarity);
+        _visible = _eligible.Keys.Where(item => DismantleFilters.Matches(FilterValue(item), SelectedType, SelectedRarity?.EnumName)).ToArray();
+        var rarities = _eligible.Keys.Where(item => DismantleFilters.Matches(FilterValue(item), SelectedType, null))
+            .Select(item => item.Quality).Distinct().OrderBy(quality => quality.Priority).ToArray();
+        _view.SetFilters(DismantleFilters.AvailableTypes(values), SelectedType, rarities, SelectedRarity, !_busy && !BulkReviewing);
+        if (_list != null)
+        {
+            if (forceRebuild || (old.Length == 0 && _visible.Length > 0))
+            {
+                _list.Discard();
+                _list = AddElement(new DismantleItemList());
+                _list.FocusFirst();
+            }
+            else _list.Refresh();
+        }
+        if (_selected != null && !_visible.Contains(_selected)) Select(null);
+        if (_visible.Length == 0)
+        {
+            _view.SetDetails("No items available to dismantle.", "Change a filter or return to the bench.");
+            if (_lastResult.Length == 0) _view.SetStatus("");
+        }
+        _bulkPrompt.SetActive(BulkAvailable);
+        _bulkPrompt.SetVisible(BulkAvailable);
+    }
+
+    internal void ChangeType(string type)
+    {
+        if (_busy || BulkReviewing || !DismantleFilters.AvailableTypes(_eligible.Keys.Select(FilterValue)).Contains(type)) return;
+        SelectedType = type;
+        Select(null);
+        ApplyFilters(true);
+    }
+
+    internal void SetRarity(ItemQuality? quality)
+    {
+        if (_busy || BulkReviewing || (quality != null && !_eligible.Keys.Any(item =>
+            DismantleFilters.Matches(FilterValue(item), SelectedType, quality.EnumName)))) return;
+        SelectedRarity = quality;
+        Select(null);
+        ApplyFilters(true);
+    }
+
+    internal void CycleRarity()
+    {
+        ItemQuality?[] choices = new ItemQuality?[] { null }.Concat(_eligible.Keys
+            .Where(item => DismantleFilters.Matches(FilterValue(item), SelectedType, null)).Select(item => item.Quality)
+            .Distinct().OrderBy(quality => quality.Priority)).ToArray();
+        int current = Array.IndexOf(choices, SelectedRarity);
+        SetRarity(choices[(current + 1) % choices.Length]);
+    }
+
+    private sealed class BulkEntry
+    {
+        internal Quote Quote { get; }
+        internal ItemQuality Quality { get; }
+        internal string Type { get; }
+        internal BulkEntry(Quote quote) { Quote = quote; Quality = quote.Source.Quality; Type = Category(quote.Source); }
+    }
+
+    internal void OpenBulkReview()
+    {
+        if (!BulkAvailable) return;
+        RebuildSnapshot();
+        if (!BulkAvailable) return;
+        try
+        {
+            _review = _visible.Select(item =>
+            {
+                Quote single = _eligible[item];
+                int batches = DismantleFilters.WholeBatches(item.Quantity, single.Plan.Recipe.Quantity);
+                return new BulkEntry(_catalog.Quote(item, batches));
+            }).ToArray();
+            var totals = new BulkRecovery(_review.Select(entry => entry.Quote.Plan));
+            Select(null);
+            BulkCompleted = 0;
+            BulkReviewing = true;
+            string entries = string.Join("\n\n", _review.Select(entry =>
+            {
+                Quote q = entry.Quote;
+                string comparison = q.IsExact ? "Exact recipe" : "Materials based on: " + q.MatchedName;
+                return $"{q.Source.DisplayName} | {q.Source.Quality.DisplayName}\nConsume {q.Plan.Consumed}; upgrade level {q.DisplayLevel}; {comparison}" +
+                    (q.Source.IsArrow || q.Source.IsThrowable ? $"\n{q.Plan.Batches} complete batches; retain {q.SourceQuantity - q.Plan.Consumed}" : "");
+            }));
+            string materials = string.Join("\n", totals.Maximum.Select(p => $"{totals.Minimum[p.Key]}–{p.Value} {_catalog.Material(p.Key).ItemName}"));
+            _view.ShowBulkReview($"DISMANTLE ALL — {SelectedType} / {SelectedRarity!.DisplayName}\n\n" +
+                $"{_review.Length} inventory entries; {totals.Consumed} units consumed. Gold cost: 0.\n" +
+                "Cancel before confirmation to keep everything. After starting, cancellation keeps completed dismantles.\n\n" +
+                entries + "\n\nTOTAL MATERIAL RETURN RANGES\n" + materials);
+            _view.SetStatus("Review every item, then hold the confirmation control.");
+            UpdateBulkControls();
+        }
+        catch (Exception error)
+        {
+            _review = Array.Empty<BulkEntry>();
+            BulkReviewing = false;
+            _view.HideBulkReview();
+            _view.SetStatus("Cannot prepare bulk dismantling: " + error.Message);
+            UpdateBulkControls();
+        }
+    }
+
+    private void UpdateBulkControls()
+    {
+        _confirm.OnHoldInterrupted();
+        _confirm.ChangeName(BulkReviewing ? "Confirm dismantle all" : "Dismantle");
+        _confirm.SetActive(BulkReviewing && !_busy);
+        _bulkPrompt.SetActive(BulkAvailable);
+        _bulkPrompt.SetVisible(BulkAvailable);
+        _back.ChangeName(BulkProcessing ? "Stop after current item" : BulkReviewing ? "Cancel review" : "Back");
+        _view.SetProcessing(_busy);
+        _view.SetFilters(DismantleFilters.AvailableTypes(_eligible.Keys.Select(FilterValue)), SelectedType,
+            _eligible.Keys.Where(item => DismantleFilters.Matches(FilterValue(item), SelectedType, null))
+                .Select(item => item.Quality).Distinct().OrderBy(quality => quality.Priority).ToArray(), SelectedRarity, !_busy && !BulkReviewing);
+    }
+
+    private void ValidateEntry(BulkEntry entry)
+    {
+        Quote prior = entry.Quote;
+        _catalog.Revalidate(prior.Plan.Recipe);
+        Quote current = _catalog.Quote(prior.Source, prior.Plan.Batches);
+        if (Category(prior.Source) != entry.Type || prior.Source.Quality != entry.Quality ||
+            current.SourceQuantity != prior.SourceQuantity || current.DisplayLevel != prior.DisplayLevel ||
+            current.Plan.Recipe.Id != prior.Plan.Recipe.Id || !current.Plan.PerBatch.SequenceEqual(prior.Plan.PerBatch))
+            throw new InvalidOperationException("An item or recipe changed after the review.");
+    }
+
+    private void StartBulk()
+    {
+        try { foreach (BulkEntry entry in _review) ValidateEntry(entry); }
+        catch (Exception error)
+        {
+            BulkReviewing = false;
+            _view.HideBulkReview();
+            try
+            {
+                _catalog = new GameCatalog();
+                RebuildSnapshot();
+                OpenBulkReview();
+                _view.SetStatus((BulkReviewing ? "Review updated; confirm again. " : "Bulk review is no longer available. ") + error.Message);
+            }
+            catch (Exception refreshError)
+            {
+                _view.SetStatus("Cannot refresh the review. Reopen the menu. " + refreshError.Message);
+            }
+            UpdateBulkControls();
+            return;
+        }
+        BulkProcessing = true;
+        _busy = true;
+        _cancelRequested = false;
+        _bulkReturns.Clear();
+        UpdateBulkControls();
+        _view.SetBulkProgress($"Dismantling 0 / {_review.Length}. Completed dismantles are kept if you stop.");
+    }
+
+    internal void Tick()
+    {
+        if (HasBeenDiscarded || !IsFullyInitialized) return;
+        if (!BulkProcessing)
+        {
+            if (_dirty && !BulkReviewing && !_busy) RebuildSnapshot();
+            return;
+        }
+        if (_cancelRequested || BulkCompleted == _review.Length)
+        {
+            FinishBulk(BulkCompleted == _review.Length ? "Complete." : "Stopped by player.");
+            return;
+        }
+        try
+        {
+            BulkEntry entry = _review[BulkCompleted];
+            ValidateEntry(entry);
+            IReadOnlyDictionary<string, int> returned = NativeInventory.Execute(_catalog, entry.Quote);
+            foreach (var p in returned)
+            {
+                _bulkReturns.TryGetValue(p.Key, out int count);
+                _bulkReturns[p.Key] = checked(count + p.Value);
+            }
+            BulkCompleted++;
+            _view.SetBulkProgress($"Dismantling {BulkCompleted} / {_review.Length}. Completed dismantles are kept if you stop.");
+            if (NativeInventory.Disabled) FinishBulk("Stopped after an inventory callback error. Review the log before saving.");
+        }
+        catch (Exception error)
+        {
+            Plugin.Log.LogError("Bulk dismantling stopped: " + error);
+            FinishBulk(error.Message);
+        }
+    }
+
+    private void FinishBulk(string reason)
+    {
+        BulkProcessing = false;
+        BulkReviewing = false;
+        _busy = false;
+        _view.HideBulkReview();
+        _lastResult = $"{reason} Dismantled {BulkCompleted} / {_review.Length} entries; {_review.Length - BulkCompleted} remaining.\nRecovered: " +
+            (_bulkReturns.Count == 0 ? "none" : string.Join(", ", _bulkReturns.Select(p => $"{p.Value} {_catalog.Material(p.Key).ItemName}")));
+        _view.SetStatus(_lastResult);
+        _view.SetDetails("Bulk dismantling finished", "Select an item or change filters to continue.");
+        UpdateBulkControls();
+        RebuildSnapshot();
     }
 
     internal void Select(Item? item)
     {
-        if (_busy || HasBeenDiscarded) return;
+        if (_busy || BulkReviewing || HasBeenDiscarded) return;
         _view.SetStatus(_lastResult);
         _confirm.OnHoldInterrupted();
         _confirm.SetActive(false);
@@ -124,6 +395,7 @@ internal sealed class DismantleUI : Model, IUIStateSource, IItemChooseParent, IP
 
     private void Confirm()
     {
+        if (!_busy && BulkReviewing) { StartBulk(); return; }
         if (_busy || _quote == null || HasBeenDiscarded) return;
         Quote quote = _quote;
         _busy = true;
@@ -144,7 +416,8 @@ internal sealed class DismantleUI : Model, IUIStateSource, IItemChooseParent, IP
             _view.SetStatus(result);
             double presentationMs = timer.Elapsed.TotalMilliseconds - transactionMs;
             timer.Restart();
-            _list.Refresh();
+            _busy = false;
+            RebuildSnapshot();
             Plugin.Log.LogInfo($"Dismantling timings: transaction={transactionMs:F1} ms; result={presentationMs:F1} ms; refresh={timer.Elapsed.TotalMilliseconds:F1} ms.");
         }
         catch (Exception error)
@@ -162,6 +435,17 @@ internal sealed class DismantleUI : Model, IUIStateSource, IItemChooseParent, IP
 
     public void Close()
     {
+        if (BulkProcessing) { _cancelRequested = true; return; }
+        if (BulkReviewing)
+        {
+            BulkReviewing = false;
+            _review = Array.Empty<BulkEntry>();
+            _view.HideBulkReview();
+            _view.SetStatus("Bulk review cancelled. No items dismantled.");
+            UpdateBulkControls();
+            RebuildSnapshot();
+            return;
+        }
         if (!_busy) Discard();
     }
 
@@ -192,209 +476,18 @@ internal sealed class DismantleItemList : ItemChooseUI<DismantleUI>
     internal void FocusFirst()
     {
         _listedItems = new HashSet<Item>(Items);
+        ParentModel.View<VDismantleUI>().BindInventoryTabs(_itemsUI);
         _itemsUI.FocusFirstItem().Forget();
     }
     internal void Refresh()
     {
         var current = new HashSet<Item>(Items);
+        foreach (ItemsListUI list in _itemsUI.Elements<ItemsListUI>().GetManagedEnumerator())
+        foreach (ItemsListElementUI row in list.Elements<ItemsListElementUI>().GetManagedEnumerator().ToArray())
+            if (!current.Contains(row.Item)) row.Discard();
         // Native rows remove discarded items and observe quantity changes. Rebuild only for new equipment.
         if (current.Any(item => !_listedItems.Contains(item))) _itemsUI.FullRefresh();
         else _itemsUI.SoftRefresh();
         _listedItems = current;
-    }
-}
-
-internal sealed class VDismantleUI : View<DismantleUI>
-{
-    private readonly List<TempItemDescriptor> _previews = new List<TempItemDescriptor>();
-    private readonly List<GameObject> _slots = new List<GameObject>();
-    private Transform _grid = null!;
-    private ItemSlotUI _slotTemplate = null!;
-    private TMP_Text _heading = null!;
-    private TMP_Text _details = null!;
-    private TMP_Text _status = null!;
-    private TMP_Text _fontTemplate = null!;
-    private LayoutElement _gridSize = null!;
-
-    internal Transform InventoryHost { get; private set; } = null!;
-    internal Transform TooltipHost { get; private set; } = null!;
-    internal Transform FooterHost { get; private set; } = null!;
-    internal VGenericPromptUI ConfirmView { get; private set; } = null!;
-
-    private void Update()
-    {
-        if (Target != null && !Target.HasBeenDiscarded) Target.PreserveSelectedTooltip();
-    }
-
-    protected override void OnInitialize()
-    {
-        InventoryHost = Required("LeftContent");
-        Transform right = Required("RightContent");
-        _grid = Required("RightContent/DismantleIngredients/DismantleIngredients");
-        _slotTemplate = Required("RightContent/DismantleIngredients/DismantleIngredients/ItemSlot").GetComponent<ItemSlotUI>()
-            ?? throw new InvalidOperationException("The dismantling ingredient slot is missing.");
-        _fontTemplate = Required("RightContent/DismantleIngredients/Title").GetComponent<TMP_Text>()
-            ?? throw new InvalidOperationException("The dismantling font binding is missing.");
-        ConfirmView = Required("RightContent/VGenericPromptUI").GetComponent<VGenericPromptUI>()
-            ?? throw new InvalidOperationException("The dismantling confirmation prompt is missing.");
-
-        Stretch((RectTransform)transform, 0, 0, 1, 1);
-        Stretch((RectTransform)InventoryHost, 0.025f, 0.16f, 0.36f, 0.85f);
-        Stretch((RectTransform)right, 0.71f, 0.19f, 0.975f, 0.85f);
-        right.GetComponent<CanvasGroup>().alpha = 1f;
-        var rightLayout = right.GetComponent<VerticalLayoutGroup>();
-        rightLayout.childControlWidth = true;
-        rightLayout.childControlHeight = true;
-        rightLayout.childForceExpandHeight = false;
-        rightLayout.childAlignment = TextAnchor.UpperLeft;
-        rightLayout.spacing = 12;
-        // The retained ingredient wrapper uses fixed anchors. Put its native grid in the flow layout.
-        Transform ingredientWrapper = _grid.parent;
-        _grid.SetParent(right, false);
-        ingredientWrapper.gameObject.SetActive(false);
-        _grid.GetComponent<ContentSizeFitter>().enabled = false;
-        _gridSize = _grid.gameObject.AddComponent<LayoutElement>();
-        _gridSize.preferredHeight = 0;
-        var gridLayout = _grid.GetComponent<GridLayoutGroup>();
-        gridLayout.constraint = GridLayoutGroup.Constraint.FixedColumnCount;
-        gridLayout.constraintCount = 3;
-        gridLayout.cellSize = new Vector2(100, 150);
-        gridLayout.spacing = new Vector2(12, 10);
-        _slotTemplate.gameObject.SetActive(false);
-        Required("RightContent/Cost").gameObject.SetActive(false);
-        _fontTemplate.gameObject.SetActive(false);
-
-        var background = (RectTransform)Required("BackgroundSlot");
-        Stretch(background, 0, 0, 1, 1);
-        background.SetAsFirstSibling();
-        // Keep an opaque local surface; the native map background intentionally shows the world.
-        var backdrop = background.gameObject.AddComponent<Image>();
-        backdrop.color = new Color(0.11f, 0.115f, 0.12f, 1f);
-        backdrop.raycastTarget = true;
-        backdrop.canvasRenderer.SetAlpha(1f);
-
-        TooltipHost = NewRect("SelectedItemTooltip", transform);
-        Stretch((RectTransform)TooltipHost, 0.38f, 0.18f, 0.69f, 0.85f);
-        FooterHost = NewRect("Prompts", transform);
-        Stretch((RectTransform)FooterHost, 0.025f, 0.035f, 0.975f, 0.085f);
-        var footerLayout = FooterHost.gameObject.AddComponent<HorizontalLayoutGroup>();
-        footerLayout.childForceExpandWidth = false;
-        footerLayout.childForceExpandHeight = false;
-        footerLayout.childAlignment = TextAnchor.MiddleLeft;
-        footerLayout.spacing = 32;
-
-        var title = NewText("Title", transform, 36);
-        Stretch(title.rectTransform, 0.025f, 0.89f, 0.975f, 0.96f);
-        title.text = "DISMANTLE";
-        _heading = NewText("SelectedItem", right, 26);
-        _heading.transform.SetAsFirstSibling();
-        _details = NewText("RecoveryDetails", right, 18);
-        _details.transform.SetSiblingIndex(1);
-        _grid.SetSiblingIndex(2);
-        var cost = NewText("Cost", right, 22);
-        cost.text = "Gold cost: 0";
-        cost.transform.SetSiblingIndex(3);
-        ConfirmView.transform.SetAsLastSibling();
-        var confirmSize = ConfirmView.GetComponent<LayoutElement>() ?? ConfirmView.gameObject.AddComponent<LayoutElement>();
-        confirmSize.preferredHeight = 55;
-        _status = NewText("Result", transform, 22);
-        Stretch(_status.rectTransform, 0.025f, 0.09f, 0.975f, 0.15f);
-        _status.color = new Color(0.8f, 0.9f, 0.9f);
-        SetDetails("Select an item", "Recover 50–100% of recipe materials.\nSingle-unit ingredients always return one.");
-    }
-
-    internal void ShowQuote(GameCatalog catalog, Quote quote)
-    {
-        string match = quote.IsExact ? "Exact crafting recipe" : "Materials based on: " + quote.MatchedName;
-        string upgrade = quote.Plan.Upgrades.Count == 0 ? "" : "\nIncludes estimated upgrade materials: " +
-            string.Join(", ", quote.Plan.Upgrades.Select(p => $"{p.Value} {catalog.Material(p.Key).ItemName}"));
-        SetDetails(quote.Source.DisplayName, $"Consume: {quote.Plan.Consumed}\n{match}\nRecovery: 50–100%, rounded up.{upgrade}");
-        foreach (var ingredient in quote.Plan.Maximum)
-        {
-            var descriptor = new TempItemDescriptor(catalog.Material(ingredient.Key), Target,
-                ingredient.Value, 0, 0, 0);
-            _previews.Add(descriptor);
-            RectTransform cell = NewRect("RecoveredMaterial", _grid);
-            _slots.Add(cell.gameObject);
-            GameObject clone = Object.Instantiate(_slotTemplate.gameObject, cell, false);
-            Stretch((RectTransform)clone.transform, 0, 0.27f, 1, 1);
-            var slot = clone.GetComponent<ItemSlotUI>();
-            slot.ResetHoveredState();
-            slot.Setup(descriptor.ExistingItem, this);
-            slot.SetVisibilityConfig(ItemSlotUI.VisibilityConfig.Crafting);
-            int minimum = quote.Plan.Minimum[ingredient.Key];
-            Transform quantity = clone.transform.Find("QuantitySlot");
-            quantity.gameObject.SetActive(true);
-            var label = quantity.GetComponentInChildren<TMP_Text>(true);
-            label.text = minimum == ingredient.Value ? ingredient.Value.ToString() : $"{minimum}–{ingredient.Value}";
-            label.gameObject.SetActive(true);
-            clone.SetActive(true);
-            TMP_Text name = NewText("MaterialName", cell, 16);
-            Stretch(name.rectTransform, 0, 0, 1, 0.25f);
-            name.alignment = TextAlignmentOptions.Top;
-            name.text = catalog.Material(ingredient.Key).ItemName;
-        }
-        _gridSize.preferredHeight = ((_slots.Count + 2) / 3) * 160;
-    }
-
-    internal void SetDetails(string heading, string details)
-    {
-        _heading.text = heading;
-        _details.text = details;
-    }
-
-    internal void SetStatus(string text) => _status.text = text;
-
-    internal void ClearIngredients()
-    {
-        foreach (GameObject slot in _slots) if (slot != null) Object.Destroy(slot);
-        _slots.Clear();
-        if (_gridSize != null) _gridSize.preferredHeight = 0;
-        foreach (TempItemDescriptor preview in _previews) preview.Dispose();
-        _previews.Clear();
-    }
-
-    protected override IBackgroundTask OnDiscard()
-    {
-        ClearIngredients();
-        return null!;
-    }
-
-    private Transform Required(string path) => transform.Find(path)
-        ?? throw new InvalidOperationException("Dismantling layout binding missing: " + path);
-
-    private TMP_Text NewText(string name, Transform parent, float size)
-    {
-        RectTransform rect = NewRect(name, parent);
-        var text = rect.gameObject.AddComponent<TextMeshProUGUI>();
-        text.font = _fontTemplate.font;
-        text.fontSharedMaterial = _fontTemplate.fontSharedMaterial;
-        text.fontSize = size;
-        text.color = _fontTemplate.color;
-        text.alignment = TextAlignmentOptions.TopLeft;
-        text.textWrappingMode = TextWrappingModes.Normal;
-        text.raycastTarget = false;
-        var layout = rect.gameObject.AddComponent<LayoutElement>();
-        layout.flexibleWidth = 1;
-        return text;
-    }
-
-    private static RectTransform NewRect(string name, Transform parent)
-    {
-        var go = new GameObject(name, typeof(RectTransform));
-        go.layer = parent.gameObject.layer;
-        var rect = (RectTransform)go.transform;
-        rect.SetParent(parent, false);
-        return rect;
-    }
-
-    private static void Stretch(RectTransform rect, float left, float bottom, float right, float top)
-    {
-        rect.anchorMin = new Vector2(left, bottom);
-        rect.anchorMax = new Vector2(right, top);
-        rect.pivot = new Vector2(0.5f, 0.5f);
-        rect.offsetMin = Vector2.zero;
-        rect.offsetMax = Vector2.zero;
-        rect.localScale = Vector3.one;
     }
 }

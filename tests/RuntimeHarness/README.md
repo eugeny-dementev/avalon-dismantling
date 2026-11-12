@@ -58,6 +58,8 @@ Wait for `last-command.json` to report completion before sending another command
 | `open-bench` | Open the native bench menu with a loaded handcrafting station configuration. |
 | `close-bench` | Close the dismantling and bench test models. |
 | `run-tests` | Run native inventory tests and write `native-tests.json`. |
+| `run-bulk-tests` | Check eligible filters, review, cancellation, queue safety, and complete batches; write `bulk-tests.json`. |
+| `benchmark-bulk` | Time eleven synthetic queue entries and verify that pending native inventory rows retain their identities. |
 | `benchmark` | Time three synthetic sword confirmations with the copied inventory; verify retained and removed native rows. |
 | `run-ui-tests` | Check selection, cancellation, reopening, and native confirmation callbacks; write `ui-tests.json`. |
 | `test-vanilla-crafting` | Close a test Dismantle menu, open native Craft, and select a learned recipe without crafting. |
@@ -90,6 +92,19 @@ They also cover cancellation, favourite, locked, and attached relic protection, 
 The relic fixture attaches a synthetic weapon relic through the native `ItemGems.AttachGem` method.
 Additional protection checks use suitable existing items from the copied profile.
 The report marks unavailable fixtures as skipped. A skipped case is not a passing result.
+
+Run `close-bench` before `run-bulk-tests`.
+Bulk fixtures temporarily lock original eligible copied-profile items, so only synthetic sources enter test queues.
+Each fixture removes those temporary locks and restores inventory afterward.
+The tests disable their view's automatic update and call the controller's queue tick explicitly.
+They count recovery calls to verify that review and cancellation do not roll material returns.
+The frozen-queue fixture temporarily returns a Shortsword from its own recipe, then restores the recipe definition.
+This fixture verifies that newly recovered eligible equipment never extends the confirmed queue.
+The suite also checks excessive upgrade estimates and a disabled inventory between queue entries.
+The disabled-state fixture restores the original flag before cleanup.
+Run `close-bench` before `benchmark-bulk`.
+This benchmark consumes ten synthetic equipment items and a complete 100-arrow stack, then restores the copied inventory.
+Its report records review time, each queue tick, and total elapsed time including yielded render frames.
 
 Close the dismantling menu before `run-ui-tests`.
 UI tests call native prompt events and callbacks. They verify interrupted holds and repeated confirmation without sending physical input.
