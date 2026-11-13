@@ -1,5 +1,11 @@
 # Changelog
 
+## 1.1.1
+
+- Consolidate compatible stackable items in carried inventory when opening Dismantle.
+- Merge recovered stackable materials after a successful dismantling transaction.
+- Retain native item matching and prevent integer overflow when selecting a destination.
+
 ## 1.1.0
 
 - Show only items with valid recovery previews and no protection restrictions.

@@ -2,7 +2,7 @@
 
 Recover crafting materials from equipment at crafting benches in **Tainted Grail: The Fall of Avalon**.
 
-Version 1.1.0 targets the **1.30.012 Mono build** with **BepInEx 5.4.23.6 x64**. IL2CPP builds are unsupported.
+Version 1.1.1 targets the **1.30.012 Mono build** with **BepInEx 5.4.23.6 x64**. IL2CPP builds are unsupported.
 
 Downloads: [GitHub releases](https://github.com/eugeny-dementev/avalon-dismantling/releases) · [Nexus Mods](https://www.nexusmods.com/taintedgrailthefallofavalon/mods/395)
 
@@ -86,7 +86,8 @@ No Crafting Gold remains responsible for normal crafting and upgrading fees.
 
 See [validation notes](docs/VALIDATION.md) for completed checks and remaining limitations.
 Inventory transactions validate delivery and attempt rollback before consuming the source.
-Recovered materials can appear as separate stacks. This avoids unsafe merging after the source item has been consumed.
+Opening Dismantle consolidates compatible stackable items in the carried inventory using the game's stacking rules. Recovered materials are also merged after dismantling. Weapons and armor that the game marks non-stackable remain separate.
+Native stacking modifies the destination before discarding the source. An inventory callback failure during this operation may duplicate items. Back up saves before use.
 Arbitrary third-party callbacks can have irreversible side effects. The mod disables further transactions after an unrecoverable error.
 
 ## Build

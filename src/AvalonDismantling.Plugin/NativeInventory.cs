@@ -158,8 +158,7 @@ internal static class NativeInventory
         {
             if (remaining == 0 && !source.HasBeenDiscarded && !source.IsBeingDiscarded) source.Discard();
             foreach (Item staged in created.Where(i => !delivered.Contains(i))) Cleanup(inventory, staged, beforeItems);
-            // Native merging changes the destination before discarding the source and can duplicate on callback errors.
-            // shortcut: keep recovered stacks separate until a transactional native merge is available.
+            StackItems(inventory, delivered);
             inventory.TriggerChange();
         }
         catch (Exception cleanupError)
@@ -169,6 +168,17 @@ internal static class NativeInventory
         }
         Plugin.Log.LogInfo($"Dismantled {current.Plan.Consumed} x {source.Template.GUID}; recipe={current.Plan.Recipe.Id}; returned={string.Join(",", recovery.Select(p => p.Key + ":" + p.Value))}");
         return recovery;
+    }
+
+    internal static void StackItems(HeroItems inventory, IEnumerable<Item> items)
+    {
+        foreach (Item item in items.ToArray())
+        {
+            if (item.HasBeenDiscarded || item.IsBeingDiscarded || item.Inventory != inventory || !item.CanStack || item.Quantity <= 0) continue;
+            Item[] candidates = inventory.Inventory.Where(other => other != item && other.Quantity > 0 &&
+                other.Quantity <= int.MaxValue - item.Quantity).ToArray();
+            ItemUtils.TryStackItem(candidates, item, out _);
+        }
     }
 
     private static void ApplyCurrency(CurrencyStat currency, float before, int amount)

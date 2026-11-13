@@ -18,8 +18,8 @@ foreach ($name in @('README.md', 'LICENSE', 'CHANGELOG.md')) {
 $docsTarget = Join-Path $stage 'docs'
 New-Item -ItemType Directory -Path $docsTarget -Force | Out-Null
 Copy-Item -LiteralPath (Join-Path $repoRoot 'docs/VALIDATION.md') -Destination $docsTarget
-$zip = Join-Path $output 'AvalonDismantling-1.1.0-Mono.zip'
+$zip = Join-Path $output 'AvalonDismantling-1.1.1-Mono.zip'
 Compress-Archive -Path (Join-Path $stage '*') -DestinationPath $zip -Force
 $hash = (Get-FileHash -LiteralPath $zip -Algorithm SHA256).Hash.ToLowerInvariant()
-[IO.File]::WriteAllText((Join-Path $output 'SHA256SUMS.txt'), "$hash  AvalonDismantling-1.1.0-Mono.zip`n")
+[IO.File]::WriteAllText((Join-Path $output 'SHA256SUMS.txt'), "$hash  AvalonDismantling-1.1.1-Mono.zip`n")
 Write-Output $zip
